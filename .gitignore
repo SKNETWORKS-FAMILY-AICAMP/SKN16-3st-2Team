@@ -22,8 +22,8 @@ vectordb/
 Thumbs.db
 
 # PDF and data (keep only originals in data/pdfs)
-data/raw/
-data/processed/
+# data/raw/
+# data/processed/
 
 # Logs
 *.log
