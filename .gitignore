@@ -24,6 +24,7 @@ Thumbs.db
 # PDF and data (keep only originals in data/pdfs)
 # data/raw/
 # data/processed/
+*.Identifier
 
 # Logs
 *.log
