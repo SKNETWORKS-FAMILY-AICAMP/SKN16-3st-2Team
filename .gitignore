@@ -1,0 +1,32 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# VSCode settings
+.vscode/
+
+# Environment files
+.env
+.venv/
+venv/
+
+# Data and vectorDB
+vectordb/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# PDF and data (keep only originals in data/pdfs)
+data/raw/
+data/processed/
+
+# Logs
+*.log
+
+# Ignore all files in scripts output (if any)
+scripts/output/
