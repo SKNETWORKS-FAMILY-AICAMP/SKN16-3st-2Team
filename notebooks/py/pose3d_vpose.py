@@ -66,23 +66,26 @@ def _normalize_2d_sequence(kps_2d_seq: np.ndarray, min_scale: float = 1e-6) -> n
     return out
 
 
-def _receptive_field(filter_widths: List[int]) -> int:
+def _get_receptive_field_size(filter_widths: List[int], causal: bool) -> int:
     """
-    VideoPose3D 모델의 유효 수용장(receptive field) 크기를 계산합니다.
-    논문(VideoPose3D)의 Temporal Model은 각 conv1d 레이어에서 양쪽으로 (filter_width - 1) * dilation 이 영향을 미칩니다.
-    dilation은 filter_widths가 동일한 경우 보통 1, 3, 9, ... 등으로 증가합니다.
-    여기는 간소화된 버전이며, 실제 TemporalModel의 정확한 Receptive Field 계산은 더 복잡할 수 있습니다.
-    일반적으로 `filter_widths = [3, 3, 3, 3, 3]` 인 경우 RF = 81 (non-causal) 혹은 73 (causal) 으로 알려져 있습니다.
-    가장 보수적으로 필터 폭들의 합을 기반으로 RF를 추정하고, 실제 Conv1D 오류를 피하기 위해 더 큰 값으로 설정하는 것이 안전합니다.
+    VideoPose3D 모델의 실제 Receptive Field 크기를 계산합니다.
+    filter_widths=[3,3,3,3,3] (H36M Pretrained 모델의 기본값) 기준:
+    Non-causal (causal=False): RF = 243
+    Causal (causal=True): RF = 73
     """
-    # 실제 VideoPose3D의 RF는 2 * sum( (fw - 1) * dilation ) + 1 이지만,
-    # dilation을 자동으로 추정하기 어려워 단순히 filter_widths의 합으로 근사하고
-    # 안정적인 추론을 위한 최소 길이로 보강하는 방식이 더 현실적입니다.
-    # 경험적으로 non-causal의 경우 243프레임(3^5) 이상이면 매우 안전합니다.
-    # 에러 메시지에서 kernel size가 55로 나온 것을 보면, 모델 내부적으로 팽창(dilation)이 많이 되는 레이어가 있는 것으로 보입니다.
-    # 따라서, RF를 단순히 filter_widths 합산보다는 더 크게,
-    # 예를 들어 243 (3^5, 즉 3x3 필터가 5번 연속 적용될 때의 이론상 최대 RF)으로 가정하는 것이 더 안전합니다.
-    return 243 # 매우 보수적으로 설정
+    # VideoPose3D 논문에 기반한 값
+    if filter_widths == [3, 3, 3, 3, 3]:
+        return 73 if causal else 243
+    # 그 외의 filter_widths에 대해서는 보수적인 추정치를 반환합니다.
+    # 더 정확한 계산이 필요하면 common/model.py 의 _calculate_receptive_field 함수를 참조해야 합니다.
+    # 여기서는 안전한 값을 위해 최대치를 가정합니다.
+    rf = 1
+    for fw in filter_widths:
+        # non-causal인 경우 양쪽으로 (fw-1) * dilation 이 영향을 미치므로 2를 곱함
+        # 각 레이어의 dilation은 1, 3, 9, ... 등으로 가정 (3의 거듭제곱)
+        rf += (fw - 1) * 2 * (3 ** (filter_widths.index(fw))) # 단순 추정. 정확한 구현은 복잡.
+    return max(rf, 243) # 최소 243으로 보장하여 오류 회피
+
 
 def _pad_sequence_reflect(x: np.ndarray, pad: int) -> np.ndarray:
     """
@@ -95,12 +98,15 @@ def _pad_sequence_reflect(x: np.ndarray, pad: int) -> np.ndarray:
         return x
     
     # 파이토치 reflect 패딩과 유사하게 동작하도록 구현
-    if T < pad + 1: # 시퀀스 길이가 패딩 + 1보다 짧으면 전체를 반복해서 뒤집는 방식으로.
+    # 시퀀스 길이가 패딩 + 1보다 짧으면 전체를 반복해서 뒤집는 방식으로.
+    if T <= pad: # 예를 들어 T=1, pad=5 이면 x[1:pad+1]과 x[-(pad+1):-1]은 오류
         left = np.flip(np.repeat(x[0:1], pad, axis=0), axis=0) # 첫 프레임을 pad번 반복 후 뒤집기
         right = np.flip(np.repeat(x[-1:], pad, axis=0), axis=0) # 마지막 프레임을 pad번 반복 후 뒤집기
     else: # 시퀀스 길이가 충분한 경우
-        left = np.flip(x[1 : pad + 1], axis=0) # x[0]을 기준으로 그 다음 pad개를 뒤집음
-        right = np.flip(x[-(pad + 1) : -1], axis=0) # x[-1]을 기준으로 그 앞 pad개를 뒤집음
+        # x[0]을 기준으로 그 다음 pad개를 뒤집음
+        left = np.flip(x[1 : pad + 1], axis=0)
+        # x[-1]을 기준으로 그 앞 pad개를 뒤집음
+        right = np.flip(x[-(pad + 1) : -1], axis=0)
     
     return np.concatenate([left, x, right], axis=0)
 
@@ -128,92 +134,16 @@ def _load_temporal_model(
     if not os.path.exists(ckpt_path):
         raise Pose3DError(f"체크포인트 파일을 찾을 수 없습니다: {ckpt_path}")
     
-    # VideoPose3D 모델은 입력 채널(2D) 2개, 출력 채널(3D) 3개. num_joints는 17.
     model = TemporalModel(num_joints_in=17, in_features=2, num_joints_out=17, 
                           filter_widths=filter_widths, causal=causal,
-                          out_features=3, # 3D 출력이므로
-                          dropout=0.25) # 기본 드롭아웃 설정. 학습 시 사용된 것과 동일하게.
+                          out_features=3, 
+                          dropout=0.25)
     try:
         ckpt = torch.load(ckpt_path, map_location="cpu")
         model.load_state_dict(ckpt["model_pos"], strict=True)
     except Exception as e:
         raise Pose3DError(f"체크포인트 로드 실패: {e}")
     return model.to(device).eval()
-
-
-def _infer_sequence_center_sliding(
-    model: TemporalModel,
-    norm_2d: np.ndarray,
-    RF_estimated: int, # 이제 이 값은 보수적으로 설정된 최소 시퀀스 길이를 나타냅니다.
-    device: str
-) -> np.ndarray:
-    """
-    센터-슬라이딩 추론.
-    - 입력 시퀀스 길이가 RF_estimated(추정된 RF) 미만이면,
-      시퀀스 길이 보강(마지막 프레임 반복) 후 반사 패딩을 사용하여 안정적으로 추론.
-    - 슬라이딩 윈도우 방식으로 각 프레임 추정.
-    """
-    # VideoPose3D의 TemporalModel은 내부적으로 입력 시퀀스의 (filter_width - 1) * dilation 만큼의
-    # 앞뒤 프레임을 필요로 합니다.
-    # RF_estimated를 매우 보수적인 최소 길이(예: 243)로 설정했으므로,
-    # conv1d 에러를 피하기 위해 이 길이로 각 슬라이딩 윈도우를 구성합니다.
-    # 모델의 RF (receptive field)는 모델 생성 시 filter_widths와 causal 파라미터에 따라 결정됩니다.
-    # RF_estimated는 여기서 윈도우 크기의 최소 보장치로 사용합니다.
-    
-    # 실제 모델이 내부적으로 요구하는 최소 윈도우 길이를 고려하여 패딩 양을 조절합니다.
-    # 임의로 81 프레임을 중심으로 양쪽으로 RF_estimated만큼 패딩하는 방식 대신,
-    # RF_estimated 전체를 윈도우 길이로 가정하고, 절반을 패딩으로 활용하는 방식으로 바꿉니다.
-    # 즉, 하나의 윈도우가 RF_estimated 길이를 가져야 하고, 그 윈도우의 '중심' 프레임을 추론합니다.
-    
-    T_in = int(norm_2d.shape[0])
-    
-    # 원본 시퀀스가 RF_estimated보다 짧으면 최소 길이만큼 확장
-    norm_2d_extended = _ensure_min_time_len(norm_2d, RF_estimated)
-    
-    T_extended = int(norm_2d_extended.shape[0])
-    output_3d = np.zeros((T_extended, 17, 3), dtype=np.float32)
-
-    # 슬라이딩 윈도우의 패딩 양 (하나의 윈도우 길이 = RF_estimated 일 때 중심 프레임을 위한 패딩)
-    # 예를 들어 RF_estimated가 243이면, 좌우 패딩은 121 (243-1)/2
-    window_pad = (RF_estimated - 1) // 2
-
-    with torch.no_grad():
-        for t_idx in range(T_extended):
-            # 중심 프레임 t_idx를 기준으로 윈도우 추출 (전체 윈도우 길이 = RF_estimated)
-            start_in_extended = t_idx - window_pad
-            end_in_extended = t_idx + window_pad + 1 # exclusive
-
-            # 윈도우 경계를 벗어나는 부분은 반사 패딩 처리 (norm_2d_extended에 적용)
-            # 여기서는 norm_2d_extended 자체에 직접 슬라이싱 후 _pad_sequence_reflect를 사용하여 처리합니다.
-            # 이 로직은 `predict_3d_poses`에서 한번에 처리하도록 더 효율적으로 변경했습니다.
-            # 여기서는 이미 전체 시퀀스가 RF_estimated 길이 이상으로 확장되었다고 가정하고,
-            # 각 윈도우를 통으로 만들어서 모델에 전달하는 방식으로 수정합니다.
-            
-            # 윈도우 생성: norm_2d_extended를 충분히 패딩하여 윈도우 길이를 맞춥니다.
-            # _pad_sequence_reflect가 이미 존재하므로 이를 활용합니다.
-            # t_idx는 output_3d의 인덱스이므로,
-            # norm_2d_extended로부터 해당 윈도우를 추출하고 부족하면 반사패딩을 추가하는 방식이 필요합니다.
-            
-            # 전체 시퀀스에 대한 반사 패딩을 미리 계산합니다.
-            padded_norm_2d_seq = _pad_sequence_reflect(norm_2d_extended, window_pad)
-            
-            # t_idx에 해당하는 윈도우 추출.
-            # padded_norm_2d_seq에서 t_idx + window_pad를 시작점으로 하여 RF_estimated 길이만큼 추출
-            current_window_np = padded_norm_2d_seq[t_idx : t_idx + RF_estimated]
-            
-            # PyTorch 텐서로 변환 및 모델 입력 준비
-            # (1, RF_estimated, 17, 2) 형태로 변경
-            input_2d_tensor = torch.from_numpy(current_window_np).unsqueeze(0).to(device) 
-            
-            # 추론
-            predicted_3d_tensor = model(input_2d_tensor) # (1, RF_estimated, 17, 3)
-            
-            # 중심 프레임 결과만 저장
-            # 현재 윈도우에서 (RF_estimated - 1) // 2 인덱스가 중심 프레임
-            output_3d[t_idx] = predicted_3d_tensor.squeeze(0)[window_pad].cpu().numpy()
-
-    # 원본 시퀀스 길이에 맞춰 결과 잘라내기 (확장했던 부분이 있다면 제거)
-    return output_3d[:T_in]
 
 
 def predict_3d_poses(
@@ -225,6 +155,7 @@ def predict_3d_poses(
 ) -> np.ndarray:
     """
     2D 키포인트 시퀀스로부터 3D 포즈 시퀀스를 추정하고 루트 정규화를 수행합니다.
+    짧은 시퀀스에 대해서는 전체 시퀀스를 단일 윈도우로 확장하여 추론합니다.
 
     Args:
         kps_2d_seq (np.ndarray): 입력 2D 키포인트 시퀀스. (T, 17, 2) 형태.
@@ -251,26 +182,68 @@ def predict_3d_poses(
     if kps_2d_seq.shape[0] == 0:
         return np.empty((0, 17, 3), dtype=np.float32)
 
+    original_num_frames = kps_2d_seq.shape[0]
+
     # 1. 2D 키포인트 시퀀스 정규화 (골반 중심 이동, 스케일 정규화)
     norm_2d_seq = _normalize_2d_sequence(kps_2d_seq)
 
     # 2. TemporalModel 로드
     model = _load_temporal_model(ckpt_path, filter_widths, causal, device)
 
-    # 3. 모델 수용장(receptive field)의 최소 요구 길이 계산
-    # 이전 에러 "Kernel size: (55)"를 고려하여 훨씬 보수적인 RF를 가정합니다.
-    # VideoPose3D의 `filter_widths=[3,3,3,3,3]` (dilation 1, 3, 9, 27, 81) 일 때,
-    # non-causal 모델의 RF는 243, causal은 73 입니다.
-    # 안전하게 243으로 설정하여 `conv1d` 에러를 피합니다.
-    # 만약 causal=True 라면 73으로 줄일 수 있지만, 일반적인 성능을 위해 non-causal이 사용됩니다.
-    min_infer_length_for_model = _receptive_field(filter_widths) # 여기서는 243 반환
+    # 3. 모델의 Receptive Field (RF) 크기 가져오기
+    # 이 RF는 모델이 안정적으로 추론하기 위한 최소 윈도우 길이입니다.
+    required_rf = _get_receptive_field_size(filter_widths, causal)
     
-    # 4. 슬라이딩 윈도우 방식으로 3D 포즈 추정
-    predicted_3d_seq_raw = _infer_sequence_center_sliding(model, norm_2d_seq, min_infer_length_for_model, device)
+    # 4. 3D 포즈 추정 로직 (짧은 시퀀스 처리 강화)
+    predicted_3d_seq_raw = np.zeros((original_num_frames, 17, 3), dtype=np.float32)
+
+    with torch.no_grad():
+        if original_num_frames < required_rf:
+            # 시퀀스가 RF보다 짧을 경우: 전체 시퀀스를 RF 길이로 확장하고 단일 윈도우로 추론
+            print(f"경고: 입력 시퀀스 길이({original_num_frames})가 모델 RF({required_rf})보다 짧습니다. 단일 윈도우 확장 추론을 수행합니다.")
+            
+            # 시퀀스를 required_rf 길이까지 확장 (마지막 프레임 반복)
+            extended_norm_2d_seq = _ensure_min_time_len(norm_2d_seq, required_rf)
+            
+            # 확장된 시퀀스에 대해 반사 패딩 적용
+            # 이 단일 윈도우는 자체가 RF 크기이므로 별도의 window_pad 계산 없이 그대로 전달합니다.
+            # _pad_sequence_reflect는 여기서는 필요하지 않습니다. (아래 모델 입력 형성 참고)
+
+            # 모델 입력 텐서 형성: (1, required_rf, 17, 2)
+            input_2d_tensor = torch.from_numpy(extended_norm_2d_seq).unsqueeze(0).to(device)
+            
+            # 추론
+            predicted_3d_tensor = model(input_2d_tensor) # (1, required_rf, 17, 3)
+            
+            # 추론된 시퀀스에서 원래 길이만큼만 가져옵니다.
+            # 이 경우, 모든 프레임이 동일한 (확장된) 컨텍스트로 추론되었음을 의미합니다.
+            predicted_3d_seq_raw = predicted_3d_tensor.squeeze(0)[:original_num_frames].cpu().numpy()
+
+        else:
+            # 시퀀스 길이가 RF보다 길거나 같을 경우: 슬라이딩 윈도우 추론
+            
+            # RF의 절반만큼 패딩 (중심 프레임을 위한)
+            window_pad = (required_rf - 1) // 2
+            
+            # 전체 시퀀스에 대해 반사 패딩을 미리 적용합니다.
+            padded_norm_2d_seq = _pad_sequence_reflect(norm_2d_seq, window_pad)
+            
+            for t_idx in range(original_num_frames):
+                # padded_norm_2d_seq에서 t_idx를 중심으로 RF 크기의 윈도우를 추출
+                current_window_np = padded_norm_2d_seq[t_idx : t_idx + required_rf]
+                
+                # PyTorch 텐서로 변환 및 모델 입력 준비: (1, required_rf, 17, 2)
+                input_2d_tensor = torch.from_numpy(current_window_np).unsqueeze(0).to(device) 
+                
+                # 추론
+                predicted_3d_tensor = model(input_2d_tensor) # (1, required_rf, 17, 3)
+                
+                # 중심 프레임 결과만 저장
+                predicted_3d_seq_raw[t_idx] = predicted_3d_tensor.squeeze(0)[window_pad].cpu().numpy()
 
     # 5. 3D 포즈 루트 조인트 정규화 (골반을 원점으로)
     predicted_3d_seq_normalized = predicted_3d_seq_raw.copy()
-    for t in range(predicted_3d_seq_raw.shape[0]):
+    for t in range(original_num_frames):
         pelvis_3d = _pelvis_center_3d(predicted_3d_seq_raw[t])
         predicted_3d_seq_normalized[t] -= pelvis_3d
         
@@ -285,14 +258,18 @@ if __name__ == '__main__':
     # 1. 가상의 2D 키포인트 데이터 생성 (T, 17, 2)
     # 실제 데이터는 OpenPose, AlphaPose 등으로 추출된 2D 키포인트가 됩니다.
     # 짧은 시퀀스 테스트 (이전 에러 상황 재현을 위한)
-    num_frames = 50 # 243보다 훨씬 짧은 시퀀스로 테스트
-    dummy_kps_2d = np.random.rand(num_frames, 17, 2) * 200 + 50 # 대략적인 이미지 좌표 (50~250)
+    num_frames_short = 50 # 243보다 훨씬 짧은 시퀀스로 테스트
+    dummy_kps_2d_short = np.random.rand(num_frames_short, 17, 2) * 200 + 50 # 대략적인 이미지 좌표 (50~250)
+
+    # 긴 시퀀스 테스트
+    num_frames_long = 300 # 243보다 긴 시퀀스로 테스트
+    dummy_kps_2d_long = np.random.rand(num_frames_long, 17, 2) * 200 + 50 # 대략적인 이미지 좌표 (50~250)
+
 
     # 2. VideoPose3D 체크포인트 파일 경로 설정
     # 이 부분은 사용자 환경에 맞게 수정해야 합니다.
-    # 예: 'checkpoints/epoch_448.pth' (VideoPose3D 기본 모델)
-    # ckpt_file = "path/to/your/videopose3d_checkpoint.pth" 
     ckpt_file = "/content/VideoPose3D/checkpoint/pretrained_h36m_detectron_coco.bin" # 예시 경로
+    # VideoPose3D 레포가 /content 에 클론되어 있고, 체크포인트가 그 아래 있다고 가정.
 
     if not os.path.exists(ckpt_file):
         print(f"\n경고: 체크포인트 파일 '{ckpt_file}'을 찾을 수 없습니다.")
@@ -300,37 +277,36 @@ if __name__ == '__main__':
         print("예: wget https://dl.fbaipublicfiles.com/video-pose-3d/pretrained_h36m_detectron_coco.bin -P /content/VideoPose3D/checkpoint/")
         print("데모 실행을 건너뜁니다.")
     else:
-        print(f"\n2D 키포인트 시퀀스 shape: {dummy_kps_2d.shape}")
-        print(f"체크포인트 파일: {ckpt_file}")
-
+        print(f"\n[짧은 시퀀스 테스트: {num_frames_short} 프레임]")
+        print(f"2D 키포인트 시퀀스 shape: {dummy_kps_2d_short.shape}")
         try:
-            # 3. 3D 포즈 추정
             print("\n3D 포즈 추정 시작...")
-            estimated_3d_poses = predict_3d_poses(dummy_kps_2d, ckpt_file)
-            print("3D 포즈 추정 완료!")
-
-            # 4. 결과 확인
-            print(f"추정된 3D 포즈 시퀀스 shape: {estimated_3d_poses.shape}")
-            print("\n첫 5개 프레임의 첫 조인트 3D 좌표:")
-            print(estimated_3d_poses[:5, 0, :])
-            print("\n루트 정규화 확인 (골반(L_HIP, R_HIP)의 중심이 거의 (0,0,0)에 가까운지):")
-            # 임의 프레임의 골반 중심 확인 (idx 11, 12)
-            pelvis_center_frame_0 = (estimated_3d_poses[0, 11] + estimated_3d_poses[0, 12]) / 2
-            print(f"프레임 0의 골반 중심: {pelvis_center_frame_0}")
-            
+            estimated_3d_poses_short = predict_3d_poses(dummy_kps_2d_short, ckpt_file)
+            print(f"3D 포즈 추정 완료! Shape: {estimated_3d_poses_short.shape}")
             # 5. 전문가 파일 생성 예시
-            expert_filename = "expert_pose_data.npz"
-            np.savez_compressed(expert_filename, poses_3d=estimated_3d_poses)
-            print(f"\n전문가 3D 포즈 데이터가 '{expert_filename}'으로 저장되었습니다.")
-
-            # 6. 전문가 파일 로드 예시 및 비교 프로세스 안내
-            print(f"\n--- 전문가 파일 활용 안내 ---")
-            print(f"저장된 '{expert_filename}' 파일은 전문가의 3D 포즈 시퀀스를 담고 있습니다.")
-            print(f"사용자 영상 비교 시 이 파일을 로드하여 비교 분석을 수행하시면 됩니다.")
-            print(f"예시 로드 코드:\nloaded_expert_poses = np.load('{expert_filename}')['poses_3d']")
-            print(f"이제 'loaded_expert_poses'와 '사용자 영상에서 추출된 3D 포즈'를 비교하여 피드백을 생성할 수 있습니다.")
+            expert_filename_short = "expert_pose_data_short.npz"
+            np.savez_compressed(expert_filename_short, poses_3d=estimated_3d_poses_short)
+            print(f"전문가 3D 포즈 데이터가 '{expert_filename_short}'으로 저장되었습니다.")
 
         except Pose3DError as e:
-            print(f"\n오류 발생: {e}")
+            print(f"\n짧은 시퀀스에서 오류 발생: {e}")
         except Exception as e:
-            print(f"\n예상치 못한 오류 발생: {e}")
+            print(f"\n짧은 시퀀스에서 예상치 못한 오류 발생: {e}")
+            
+        print(f"\n{'-'*50}\n")
+
+        print(f"\n[긴 시퀀스 테스트: {num_frames_long} 프레임]")
+        print(f"2D 키포인트 시퀀스 shape: {dummy_kps_2d_long.shape}")
+        try:
+            print("\n3D 포즈 추정 시작...")
+            estimated_3d_poses_long = predict_3d_poses(dummy_kps_2d_long, ckpt_file)
+            print(f"3D 포즈 추정 완료! Shape: {estimated_3d_poses_long.shape}")
+            # 5. 전문가 파일 생성 예시
+            expert_filename_long = "expert_pose_data_long.npz"
+            np.savez_compressed(expert_filename_long, poses_3d=estimated_3d_poses_long)
+            print(f"전문가 3D 포즈 데이터가 '{expert_filename_long}'으로 저장되었습니다.")
+
+        except Pose3DError as e:
+            print(f"\n긴 시퀀스에서 오류 발생: {e}")
+        except Exception as e:
+            print(f"\n긴 시퀀스에서 예상치 못한 오류 발생: {e}")
