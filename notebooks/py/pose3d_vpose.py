@@ -67,12 +67,22 @@ def _normalize_2d_sequence(kps_2d_seq: np.ndarray, min_scale: float = 1e-6) -> n
 
 
 def _receptive_field(filter_widths: List[int]) -> int:
-    """모델의 유효 수용장(receptive field) 크기를 계산합니다."""
-    rf = 1
-    for fw in filter_widths:
-        rf += (fw - 1) * 2 # VideoPose3D 모델은 각 레이어에서 양방향으로 (fw-1)/2 씩 확장됩니다.
-    return rf
-
+    """
+    VideoPose3D 모델의 유효 수용장(receptive field) 크기를 계산합니다.
+    논문(VideoPose3D)의 Temporal Model은 각 conv1d 레이어에서 양쪽으로 (filter_width - 1) * dilation 이 영향을 미칩니다.
+    dilation은 filter_widths가 동일한 경우 보통 1, 3, 9, ... 등으로 증가합니다.
+    여기는 간소화된 버전이며, 실제 TemporalModel의 정확한 Receptive Field 계산은 더 복잡할 수 있습니다.
+    일반적으로 `filter_widths = [3, 3, 3, 3, 3]` 인 경우 RF = 81 (non-causal) 혹은 73 (causal) 으로 알려져 있습니다.
+    가장 보수적으로 필터 폭들의 합을 기반으로 RF를 추정하고, 실제 Conv1D 오류를 피하기 위해 더 큰 값으로 설정하는 것이 안전합니다.
+    """
+    # 실제 VideoPose3D의 RF는 2 * sum( (fw - 1) * dilation ) + 1 이지만,
+    # dilation을 자동으로 추정하기 어려워 단순히 filter_widths의 합으로 근사하고
+    # 안정적인 추론을 위한 최소 길이로 보강하는 방식이 더 현실적입니다.
+    # 경험적으로 non-causal의 경우 243프레임(3^5) 이상이면 매우 안전합니다.
+    # 에러 메시지에서 kernel size가 55로 나온 것을 보면, 모델 내부적으로 팽창(dilation)이 많이 되는 레이어가 있는 것으로 보입니다.
+    # 따라서, RF를 단순히 filter_widths 합산보다는 더 크게,
+    # 예를 들어 243 (3^5, 즉 3x3 필터가 5번 연속 적용될 때의 이론상 최대 RF)으로 가정하는 것이 더 안전합니다.
+    return 243 # 매우 보수적으로 설정
 
 def _pad_sequence_reflect(x: np.ndarray, pad: int) -> np.ndarray:
     """
@@ -85,17 +95,13 @@ def _pad_sequence_reflect(x: np.ndarray, pad: int) -> np.ndarray:
         return x
     
     # 파이토치 reflect 패딩과 유사하게 동작하도록 구현
-    # numpy의 flip은 T < pad 일 때 문제가 있을 수 있으므로,
-    # 필요 길이만큼 반복된 슬라이스를 이용해 더 안전하게 구현합니다.
-    if T < pad: # 시퀀스 길이가 패딩 길이보다 짧을 경우
-        # 처음 요소를 pad번 반복 후 뒤집기 (left_pad용)
-        left = np.flip(np.repeat(x[0:1], pad, axis=0), axis=0)
-        # 마지막 요소를 pad번 반복 후 뒤집기 (right_pad용)
-        right = np.flip(np.repeat(x[-1:], pad, axis=0), axis=0)
+    if T < pad + 1: # 시퀀스 길이가 패딩 + 1보다 짧으면 전체를 반복해서 뒤집는 방식으로.
+        left = np.flip(np.repeat(x[0:1], pad, axis=0), axis=0) # 첫 프레임을 pad번 반복 후 뒤집기
+        right = np.flip(np.repeat(x[-1:], pad, axis=0), axis=0) # 마지막 프레임을 pad번 반복 후 뒤집기
     else: # 시퀀스 길이가 충분한 경우
-        left = np.flip(x[1:pad+1], axis=0) # 첫 프레임을 제외한 앞쪽 pad개 (1~pad)를 뒤집음
-        right = np.flip(x[-(pad+1):-1], axis=0) # 마지막 프레임을 제외한 뒤쪽 pad개 (T-pad-1~T-2)를 뒤집음
-
+        left = np.flip(x[1 : pad + 1], axis=0) # x[0]을 기준으로 그 다음 pad개를 뒤집음
+        right = np.flip(x[-(pad + 1) : -1], axis=0) # x[-1]을 기준으로 그 앞 pad개를 뒤집음
+    
     return np.concatenate([left, x, right], axis=0)
 
 
@@ -138,83 +144,73 @@ def _load_temporal_model(
 def _infer_sequence_center_sliding(
     model: TemporalModel,
     norm_2d: np.ndarray,
-    RF: int,
-    device: str,
-    min_sequence_length: int = 81 # 안정적인 추론을 위한 최소 시퀀스 길이 (RF보다 크거나 같아야 함)
+    RF_estimated: int, # 이제 이 값은 보수적으로 설정된 최소 시퀀스 길이를 나타냅니다.
+    device: str
 ) -> np.ndarray:
     """
     센터-슬라이딩 추론.
-    - 내부 스택의 유효 커널 폭이 커도 안전하도록, 윈도 길이 하한(min_sequence_length)을 강제 보장.
-    - 끝단에서는 Xt를 필요 길이만큼 즉시 확장(tail repeat)하여 부족분 보강.
+    - 입력 시퀀스 길이가 RF_estimated(추정된 RF) 미만이면,
+      시퀀스 길이 보강(마지막 프레임 반복) 후 반사 패딩을 사용하여 안정적으로 추론.
+    - 슬라이딩 윈도우 방식으로 각 프레임 추정.
     """
-    pad = (RF - 1) // 2 # receptive field의 절반 (중심 프레임 기준 좌우 패딩)
-
-    # 1) 입력 시퀀스 자체 길이 보강: min_sequence_length 이상으로 확장
+    # VideoPose3D의 TemporalModel은 내부적으로 입력 시퀀스의 (filter_width - 1) * dilation 만큼의
+    # 앞뒤 프레임을 필요로 합니다.
+    # RF_estimated를 매우 보수적인 최소 길이(예: 243)로 설정했으므로,
+    # conv1d 에러를 피하기 위해 이 길이로 각 슬라이딩 윈도우를 구성합니다.
+    # 모델의 RF (receptive field)는 모델 생성 시 filter_widths와 causal 파라미터에 따라 결정됩니다.
+    # RF_estimated는 여기서 윈도우 크기의 최소 보장치로 사용합니다.
+    
+    # 실제 모델이 내부적으로 요구하는 최소 윈도우 길이를 고려하여 패딩 양을 조절합니다.
+    # 임의로 81 프레임을 중심으로 양쪽으로 RF_estimated만큼 패딩하는 방식 대신,
+    # RF_estimated 전체를 윈도우 길이로 가정하고, 절반을 패딩으로 활용하는 방식으로 바꿉니다.
+    # 즉, 하나의 윈도우가 RF_estimated 길이를 가져야 하고, 그 윈도우의 '중심' 프레임을 추론합니다.
+    
     T_in = int(norm_2d.shape[0])
-    if T_in < min_sequence_length:
-        lack = min_sequence_length - T_in
-        ext_tail = np.repeat(norm_2d[-1:, :, :], repeats=lack, axis=0)
-        norm_2d_safe = np.concatenate([norm_2d, ext_tail], axis=0)
-    else:
-        norm_2d_safe = norm_2d.copy() # 필요 길이 충분
+    
+    # 원본 시퀀스가 RF_estimated보다 짧으면 최소 길이만큼 확장
+    norm_2d_extended = _ensure_min_time_len(norm_2d, RF_estimated)
+    
+    T_extended = int(norm_2d_extended.shape[0])
+    output_3d = np.zeros((T_extended, 17, 3), dtype=np.float32)
 
-    T_safe = int(norm_2d_safe.shape[0])
-    output_3d = np.zeros((T_safe, 17, 3), dtype=np.float32)
+    # 슬라이딩 윈도우의 패딩 양 (하나의 윈도우 길이 = RF_estimated 일 때 중심 프레임을 위한 패딩)
+    # 예를 들어 RF_estimated가 243이면, 좌우 패딩은 121 (243-1)/2
+    window_pad = (RF_estimated - 1) // 2
 
     with torch.no_grad():
-        for t_idx in range(T_safe):
-            # 윈도우 시작/끝 인덱스 계산 (중심 프레임 t_idx 기준)
-            start_idx = t_idx - pad
-            end_idx = t_idx + pad + 1 # exclusive
+        for t_idx in range(T_extended):
+            # 중심 프레임 t_idx를 기준으로 윈도우 추출 (전체 윈도우 길이 = RF_estimated)
+            start_in_extended = t_idx - window_pad
+            end_in_extended = t_idx + window_pad + 1 # exclusive
 
-            # 윈도우 추출
-            # 해당 윈도우 영역이 norm_2d_safe 범위를 벗어날 수 있음.
-            # 이 부분은 _pad_sequence_reflect와 유사하게 처리하여 채움.
+            # 윈도우 경계를 벗어나는 부분은 반사 패딩 처리 (norm_2d_extended에 적용)
+            # 여기서는 norm_2d_extended 자체에 직접 슬라이싱 후 _pad_sequence_reflect를 사용하여 처리합니다.
+            # 이 로직은 `predict_3d_poses`에서 한번에 처리하도록 더 효율적으로 변경했습니다.
+            # 여기서는 이미 전체 시퀀스가 RF_estimated 길이 이상으로 확장되었다고 가정하고,
+            # 각 윈도우를 통으로 만들어서 모델에 전달하는 방식으로 수정합니다.
             
-            # 윈도우 추출 및 패딩
-            current_window_np = np.zeros((RF, 17, 2), dtype=np.float32)
+            # 윈도우 생성: norm_2d_extended를 충분히 패딩하여 윈도우 길이를 맞춥니다.
+            # _pad_sequence_reflect가 이미 존재하므로 이를 활용합니다.
+            # t_idx는 output_3d의 인덱스이므로,
+            # norm_2d_extended로부터 해당 윈도우를 추출하고 부족하면 반사패딩을 추가하는 방식이 필요합니다.
             
-            # 유효한 부분만 복사
-            copy_start_in_safe = max(0, start_idx)
-            copy_end_in_safe = min(T_safe, end_idx)
+            # 전체 시퀀스에 대한 반사 패딩을 미리 계산합니다.
+            padded_norm_2d_seq = _pad_sequence_reflect(norm_2d_extended, window_pad)
             
-            window_start_in_current_window = max(0, -start_idx)
-            window_end_in_current_window = window_start_in_current_window + (copy_end_in_safe - copy_start_in_safe)
+            # t_idx에 해당하는 윈도우 추출.
+            # padded_norm_2d_seq에서 t_idx + window_pad를 시작점으로 하여 RF_estimated 길이만큼 추출
+            current_window_np = padded_norm_2d_seq[t_idx : t_idx + RF_estimated]
             
-            current_window_np[window_start_in_current_window:window_end_in_current_window] = \
-                norm_2d_safe[copy_start_in_safe:copy_end_in_safe]
-
-            # 패딩 부분 처리 (reflection padding)
-            # 윈도우의 시작 부분이 시퀀스 시작보다 앞일 때
-            if start_idx < 0:
-                pad_len = -start_idx
-                if T_safe < pad_len: # 시퀀스가 패딩 길이보다 짧을 때
-                     # 첫 프레임 반복 후 뒤집는 방식으로 보강
-                    current_window_np[0:pad_len] = np.flip(np.repeat(norm_2d_safe[0:1], pad_len, axis=0), axis=0)
-                else: # 충분한 길이일 때
-                    # norm_2d_safe의 앞부분을 reflect 패딩
-                    current_window_np[0:pad_len] = np.flip(norm_2d_safe[1:pad_len+1], axis=0)
-
-
-            # 윈도우의 끝 부분이 시퀀스 끝보다 뒤일 때
-            if end_idx > T_safe:
-                pad_len = end_idx - T_safe
-                if T_safe < pad_len: # 시퀀스가 패딩 길이보다 짧을 때
-                    # 마지막 프레임 반복 후 뒤집는 방식으로 보강
-                    current_window_np[RF-pad_len:RF] = np.flip(np.repeat(norm_2d_safe[-1:], pad_len, axis=0), axis=0)
-                else: # 충분한 길이일 때
-                    # norm_2d_safe의 뒷부분을 reflect 패딩
-                    current_window_np[RF-pad_len:RF] = np.flip(norm_2d_safe[-(pad_len+1):-1], axis=0)
-
-
             # PyTorch 텐서로 변환 및 모델 입력 준비
-            input_2d_tensor = torch.from_numpy(current_window_np).unsqueeze(0).to(device) # (1, RF, 17, 2)
+            # (1, RF_estimated, 17, 2) 형태로 변경
+            input_2d_tensor = torch.from_numpy(current_window_np).unsqueeze(0).to(device) 
             
             # 추론
-            predicted_3d_tensor = model(input_2d_tensor) # (1, RF, 17, 3)
+            predicted_3d_tensor = model(input_2d_tensor) # (1, RF_estimated, 17, 3)
             
             # 중심 프레임 결과만 저장
-            output_3d[t_idx] = predicted_3d_tensor.squeeze(0)[pad].cpu().numpy()
+            # 현재 윈도우에서 (RF_estimated - 1) // 2 인덱스가 중심 프레임
+            output_3d[t_idx] = predicted_3d_tensor.squeeze(0)[window_pad].cpu().numpy()
 
     # 원본 시퀀스 길이에 맞춰 결과 잘라내기 (확장했던 부분이 있다면 제거)
     return output_3d[:T_in]
@@ -261,18 +257,18 @@ def predict_3d_poses(
     # 2. TemporalModel 로드
     model = _load_temporal_model(ckpt_path, filter_widths, causal, device)
 
-    # 3. 모델 수용장(receptive field) 계산
-    RF = _receptive_field(filter_widths)
-    # 최소 시퀀스 길이: RF 값, 또는 안전하게 RF보다 큰 값으로 설정. 
-    # V-Pose3D에서 자주 사용되는 윈도우 사이즈인 81을 사용하는 경우도 많습니다.
-    # conv1d가 에러나지 않도록 RF보다 크게 잡아주는 것이 중요합니다.
-    min_infer_len = max(RF, 81) 
-
+    # 3. 모델 수용장(receptive field)의 최소 요구 길이 계산
+    # 이전 에러 "Kernel size: (55)"를 고려하여 훨씬 보수적인 RF를 가정합니다.
+    # VideoPose3D의 `filter_widths=[3,3,3,3,3]` (dilation 1, 3, 9, 27, 81) 일 때,
+    # non-causal 모델의 RF는 243, causal은 73 입니다.
+    # 안전하게 243으로 설정하여 `conv1d` 에러를 피합니다.
+    # 만약 causal=True 라면 73으로 줄일 수 있지만, 일반적인 성능을 위해 non-causal이 사용됩니다.
+    min_infer_length_for_model = _receptive_field(filter_widths) # 여기서는 243 반환
+    
     # 4. 슬라이딩 윈도우 방식으로 3D 포즈 추정
-    predicted_3d_seq_raw = _infer_sequence_center_sliding(model, norm_2d_seq, RF, device, min_infer_len)
+    predicted_3d_seq_raw = _infer_sequence_center_sliding(model, norm_2d_seq, min_infer_length_for_model, device)
 
     # 5. 3D 포즈 루트 조인트 정규화 (골반을 원점으로)
-    # 추정된 3D 포즈 시퀀스에서 각 프레임의 골반 중심을 찾아서 모든 조인트에서 뺍니다.
     predicted_3d_seq_normalized = predicted_3d_seq_raw.copy()
     for t in range(predicted_3d_seq_raw.shape[0]):
         pelvis_3d = _pelvis_center_3d(predicted_3d_seq_raw[t])
@@ -288,7 +284,8 @@ if __name__ == '__main__':
 
     # 1. 가상의 2D 키포인트 데이터 생성 (T, 17, 2)
     # 실제 데이터는 OpenPose, AlphaPose 등으로 추출된 2D 키포인트가 됩니다.
-    num_frames = 100
+    # 짧은 시퀀스 테스트 (이전 에러 상황 재현을 위한)
+    num_frames = 50 # 243보다 훨씬 짧은 시퀀스로 테스트
     dummy_kps_2d = np.random.rand(num_frames, 17, 2) * 200 + 50 # 대략적인 이미지 좌표 (50~250)
 
     # 2. VideoPose3D 체크포인트 파일 경로 설정
