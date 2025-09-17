@@ -120,17 +120,16 @@ def _load_temporal_model(
         raise Pose3DError(f"체크포인트 파일을 찾을 수 없습니다: {ckpt_path}")
     try:
         ckpt = torch.load(ckpt_path, map_location="cpu")
-        model.load_state_dict(ckpt["model_pos"], strict=True)  # 체크포인트 구조와 동일해야 함
+        model.load_state_dict(ckpt["model_pos"], strict=True)
     except Exception as e:
         raise Pose3DError(f"체크포인트 로드 실패: {e}")
-    model = model.to(device).eval()
-    return model
+    return model.to(device).eval()
 
 
 def _extend_temporally_to_min_length(norm_2d: np.ndarray, min_len: int) -> np.ndarray:
     """
     입력 시퀀스 길이(T)가 min_len보다 짧을 때, 시간축으로 확장합니다.
-    우선 반사(reflect) 패딩, 부족하면 반복(repeat)로 추가 보강하여 최소 길이 보장.
+    1) 반사(reflect) 패딩 → 2) 반복(repeat) 패딩 순서로 최소 길이를 보장합니다.
     """
     T = int(norm_2d.shape[0])
     if T >= min_len:
@@ -149,10 +148,7 @@ def _extend_temporally_to_min_length(norm_2d: np.ndarray, min_len: int) -> np.nd
     return ext2[:min_len]
 
 
-def _ensure_min_window_and_pad_tensor(X: np.ndarray, need_len: int) -> np.ndarray:
-    """
-    패딩 후 텐서 X의 시간축 길이가 need_len 미만이면 뒤쪽 반복 패딩으로 보강합니다.
-    """
+def _ensure_min_len_numpy_time(X: np.ndarray, need_len: int) -> np.ndarray:
     if X.shape[0] >= need_len:
         return X
     lack = need_len - X.shape[0]
@@ -167,18 +163,23 @@ def _infer_center_crop(
     device: str
 ) -> np.ndarray:
     """
-    모델의 유효 커널 요구치를 만족하도록 입력을 확장/패딩하고,
-    센터-크롭 슬라이딩 방식으로 프레임별 3D를 추론합니다.
+    깊은 레이어에서 요구되는 유효 커널 폭까지 고려하여,
+    어떤 프레임에서도 윈도 길이가 부족하지 않도록 강력 보강합니다.
     """
-    # 안전 마진 포함 최소 길이(내부 스택에서 19 이상 요구되는 케이스 방지)
-    min_needed = max(RF, 27)
+    # 넉넉한 안전 마진(깊은 레이어 커널 폭 55 이상 대비)
+    min_needed = max(RF, 65)
+
+    # 1) 입력 시퀀스 자체 길이를 min_needed 이상으로 확장
     norm_2d_safe = _extend_temporally_to_min_length(norm_2d, min_needed)
 
+    # 2) RF 기반 반사 패딩
     pad = (RF - 1) // 2
     X = _pad_sequence_reflect(norm_2d_safe, pad)      # (T'+2*pad, 17, 2)
     T_prime = norm_2d_safe.shape[0]
     need_total = max(T_prime + 2 * pad, min_needed + 2 * pad)
-    X = _ensure_min_window_and_pad_tensor(X, need_total)
+
+    # 3) 패딩 결과의 전체 길이를 need_total 이상으로 보장
+    X = _ensure_min_len_numpy_time(X, need_total)
 
     out = np.zeros((T_prime, 17, 3), dtype=np.float32)
 
@@ -187,16 +188,19 @@ def _infer_center_crop(
         for i in range(T_prime):
             s = i
             e = i + 2 * pad + 1
-            # 윈도 길이 보장
+
+            # 4) 윈도 길이(min_needed) 보장
             if (e - s) < min_needed:
                 e = s + min_needed
             if e > Xt.shape[1]:
                 lack = e - Xt.shape[1]
                 tail = Xt[:, -1:, :, :].repeat(1, lack, 1, 1)
                 Xt = torch.cat([Xt, tail], dim=1)
-            window = Xt[:, s:e, :, :]                      # (1, >=min_needed, 17, 2)
 
-            y = model(window)                              # (1, t_out, 17, 3)
+            window = Xt[:, s:e, :, :]  # (1, >=min_needed, 17, 2)
+
+            # 5) 모델 추론
+            y = model(window)  # (1, t_out, 17, 3)
             y_np = y.detach().cpu().numpy()
             t_out = y_np.shape[1]
             center_idx = min((t_out - 1) // 2, (e - s - 1) // 2)
@@ -221,8 +225,8 @@ def run_vpose3d(
         "meta": {"RF": int, "PAD": int, "device": str, "T_in": int, "T_used": int}
     }
     주의:
-    - filter_widths는 체크포인트와 동일([3,3,3,3,3])을 기본으로 하며, 짧은 입력은 내부 시간축 확장으로 처리합니다.
-    - T'은 내부 확장/경계 보정으로 인해 T와 다를 수 있습니다(안정성 우선).
+    - filter_widths는 체크포인트와 동일([3,3,3,3,3])을 기본으로 사용합니다.
+    - 짧은/경계 시퀀스는 내부에서 시간축 확장 및 윈도 길이 보장으로 안전하게 처리합니다.
     """
     if "kps_2d" not in kps_pack:
         raise Pose3DError("kps_pack에 'kps_2d'가 없습니다.")
@@ -230,7 +234,7 @@ def run_vpose3d(
     if kps_2d.ndim != 3 or kps_2d.shape[1:] != (17, 2):
         raise Pose3DError(f"kps_2d 형태가 (T,17,2)가 아닙니다: {kps_2d.shape}")
 
-    # 체크포인트와 일치하는 기본 구조 유지(일반적으로 [3,3,3,3,3])
+    # 체크포인트와 일치하는 기본 구조 유지
     filter_widths = filter_widths or [3, 3, 3, 3, 3]
     RF = _receptive_field(filter_widths)
     PAD = (RF - 1) // 2
@@ -243,7 +247,7 @@ def run_vpose3d(
     # 모델 로드(체크포인트 구조와 동일)
     model = _load_temporal_model(ckpt_path=ckpt_path, filter_widths=filter_widths, causal=causal, device=device)
 
-    # 3D 추론(짧은/경계 시퀀스는 내부에서 시간축 확장 및 윈도 길이 보장)
+    # 3D 추론(내부 보강/보장 로직 포함)
     y3d_raw = _infer_center_crop(model, norm_2d, RF=RF, device=device)
     T_used = int(y3d_raw.shape[0])
 
