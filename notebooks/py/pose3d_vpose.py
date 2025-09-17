@@ -165,7 +165,10 @@ def _infer_center_crop(
     센터-크롭 슬라이딩 방식으로 프레임별 3D를 추론합니다.
     """
     # T가 RF보다 짧을 경우 시간축 확장으로 최소 길이 보장
-    norm_2d_safe = _extend_temporally_to_min_length(norm_2d, RF)
+    
+    # norm_2d_safe = _extend_temporally_to_min_length(norm_2d, RF)
+    min_needed = max(RF, 35)
+    norm_2d_safe = _extend_temporally_to_min_length(norm_2d, min_needed)
 
     pad = (RF - 1) // 2
     X = _pad_sequence_reflect(norm_2d_safe, pad)      # (T'+2*pad, 17, 2)
@@ -210,9 +213,14 @@ def run_vpose3d(
     if kps_2d.ndim != 3 or kps_2d.shape[1:] != (17, 2):
         raise Pose3DError(f"kps_2d 형태가 (T,17,2)가 아닙니다: {kps_2d.shape}")
 
+    print("[VP3D] T_in:", kps_2d.shape[0])
+    
     # 체크포인트와 일치하는 기본 구조 유지(일반적으로 [3,3,3,3,3])
     filter_widths = filter_widths or [3, 3, 3, 3, 3]
     RF = _receptive_field(filter_widths)
+
+    print("[VP3D] filter_widths:", filter_widths, "RF:", RF)
+    
     PAD = (RF - 1) // 2
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -225,6 +233,12 @@ def run_vpose3d(
 
     # 3D 추론(짧은 시퀀스는 내부에서 시간축 확장)
     y3d_raw = _infer_center_crop(model, norm_2d, RF=RF, device=device)
+
+    print("[VP3D] T_used:", y3d_raw.shape[0])
+    print("[VP3D] T_in:", norm_2d.shape[0], "min_needed:", min_needed)
+    print("[VP3D] T_after_extend:", norm_2d_safe.shape[0], "RF:", RF, "pad:", pad)
+
+    
     T_used = int(y3d_raw.shape[0])
 
     # 의미 좌표계 정규화
