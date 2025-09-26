@@ -1,4 +1,10 @@
-# Byte-compiled / optimized / DLL files
+# Byte-compil# Virtual environments
+venv/
+env/
+
+# Local execution scripts (로컬 전용)
+*_local.sh
+*_local.py files
 __pycache__/
 *.py[cod]
 *$py.class
@@ -13,9 +19,20 @@ __pycache__/
 .env
 .venv/
 venv/
+env/
+
+# Local execution scripts (로컬 전용)
+*_local.sh
+*_local.py
+
+# Local configuration
+config_local.py
+settings_local.py
 
 # Data and vectorDB
-vectordb/
+# vectordb/
+
+# Local data files
 
 # OS files
 .DS_Store
@@ -29,5 +46,13 @@ Thumbs.db
 # Logs
 *.log
 
-# Ignore all files in scripts output (if any)
-scripts/output/
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+
+# IDE specific files
+.idea/
+*.sublime-project
+*.sublime-workspace
